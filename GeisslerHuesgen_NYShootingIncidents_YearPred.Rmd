@@ -1,0 +1,445 @@
+---
+title: "Analysis of New York City Shooting Incidents"
+date: "June 2, 2021"
+author: "Elise Geissler-Huesgen"
+subtitle: "Is year (i.e. time) a good predictor for shooting incidents?"
+output:
+  pdf_document: default
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Background
+
+Gun violence continues to be a major problem in New York City, which saw
+1,942 shootings in the year 2020 alone. If data of past shootings could predict
+when and where shootings are more likely to occur, then finite resources 
+earmarked for gun violence prevention could be distributed in a more targeted 
+manner. 
+
+The dataset utilized for this project represents a list of every shooting 
+incident which has taken place in New York City between the years of 2006 
+and 2020. Each row includes information on timing and location of the 
+incident, as well as demographic data on the victim and the perpetrator. It 
+is an open-access dataset which is updated and published quarterly by the 
+New York City Police Department. 
+
+The following analysis asks the question, whether time is a good predictor for
+the number of shooting incidents that are going to occur. In other words, do 
+shooting incidents go up or down in a predictable manner through the years? 
+
+
+#  Setting up
+
+Loading all necessary libraries
+
+```{r message = FALSE, warning = FALSE, label = "libraries"}
+library(tidyverse) #data wrangling
+library (lubridate) #dates and times
+library(ggthemes) #ggplot themes
+library(broom) #for tidy() and map()
+
+#libraries for NYC map with bubble graph:
+library(httr) #for GET()
+library(rgdal) #for readOGR()
+library(geosphere)#for controid()
+```
+
+
+And loading the data:
+
+
+```{r, label = "data link"}
+
+link <- "https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD"
+raw_shootingData <- read.csv(link)
+
+head(as_tibble(raw_shootingData)) #taking a look at the data
+
+```
+
+Selecting columns:
+
+```{r message = FALSE, warning = FALSE, label = "column select"}
+shooting_data <- raw_shootingData %>% 
+                select(-c(INCIDENT_KEY, OCCUR_TIME, 
+                          PRECINCT:LOCATION_DESC,PERP_RACE,
+                          VIC_RACE, X_COORD_CD:Lon_Lat))
+```
+
+Renaming some of the longer column names:
+
+
+```{r}
+names(shooting_data)[1] <- "DATE" #shortening column name
+names(shooting_data)[3] <- "MURDER" #shortening column name
+names(shooting_data)[4] <- "PERP_AGE" #shortening column name
+names(shooting_data)[6] <- "VIC_AGE" #shortening column name
+```
+
+
+# Data cleaning
+
+## Initial overview of the data
+
+
+```{r message = FALSE, warning = FALSE, label = "data summary"}
+options(knitr.kable.NA = "") #missing variables will be empty cells in output
+knitr::kable(summary(shooting_data), caption = "Summary of data") #knitr::kable for pretty output
+```
+
+I can already spot some possible trends in data distribution, for example in 
+columns concerning age, sex, and location. These trends would be worth 
+further exploration in the future. 
+
+Given that there are so many types of data in one dataframe, I want to know 
+whether there are any data classes that need to be changed:
+
+```{r message=FALSE, warning = FALSE, label = "data classes"}
+knitr::kable(apply(shooting_data, 2, class), caption = "Variable classes",
+             col.names = c("Class")) #class by column
+```
+Everything has been imported as characters. So I will need to change the date
+column to class "date". 
+
+## Cleaning up dates
+
+Changing class of date column and adding year, month, and season columns.
+
+```{r message = FALSE, warning = FALSE, label = "date cleaning"}
+clean_data <- shooting_data %>%
+  mutate(DATE = mdy(DATE)) %>% #change to "date"
+  mutate(YEAR = year(DATE)) %>% #adding year column
+  mutate(MONTH = month(DATE, label=TRUE)) %>% #adding month column
+  mutate(SEASON = hydroTSM::time2season(DATE,out.fmt = "seasons"))%>% #seasons 
+  mutate(SEASON = replace(SEASON, SEASON == "autumm", "fall"))%>% #fixing a typo
+  select(-DATE) #removing column, it takes up lots of space and I won't need it
+knitr::kable(head(clean_data), caption = "First rows of cleaned data") # taking a look @ cleaned data
+```
+
+## Missing and unknown variables
+
+I am not sure how missing and unknown variables are coded in this dataset. 
+Therefore, I am initially looking through all unique variables per column.
+
+
+```{r message = FALSE, warning = FALSE, label = "unique variables"}
+apply(clean_data, 2, unique)  #prints unique variables for each column
+```
+
+The dataset includes "U", UNKNOWN", and empty variables. 
+
+I will initially tackle the empty variables. Instead of deleting them, 
+I will code them as "NAs", as those are easy to find and easy to delete. 
+Empty values are limited to columns 3 and 4.
+
+```{r message = FALSE, warning = FALSE, label = "empty na"}
+clean_data[,3:4][clean_data[,3:4] == ""] <- NA #changing "" to "NA" in cols 3, 4
+```
+
+## "NA" variables
+
+To see how many NAs there are:
+
+```{r message = FALSE, warning = FALSE, label = "sum na"}
+colSums(is.na(clean_data[,3:4])) %>% as.data.frame() 
+```
+
+There are a lot of NAs in the dataframe. As their presence will not affect any
+of the analyses in this document and deleting them would greatly reduce the data,
+I will not delete the affected rows. 
+
+## "UNKOWN"/"U" variables
+
+There are also rows which include "U"/"UNKNOWN", which should not be conflated 
+with the NA rows. For example, "unknowns" are likely the result of an 
+unidentified or anonymized perpetrator or victim, whereas NAs could simply be 
+the result of someone not filling in the variable. However, I am curious 
+whether NAs and "unknowns" tend to show up on the same row:
+
+```{r message = FALSE, warning = FALSE, label = "rows na unknowns"}
+na_unknowns <- clean_data %>% 
+  mutate (NAs = ifelse(rowSums(is.na(.[,3:4])) > 0,"Present", "Absent")) %>%
+  mutate (Unknowns = ifelse(apply(clean_data, 1, function(x) 
+                            any (x %in% c("UNKNOWN", "U"))),"Present", "Absent")) %>%
+  group_by(NAs, Unknowns) %>%
+  summarise(Count = n()) %>%
+  mutate(Ratio_NaUnk = paste0(round(100*Count/sum(Count),0), "%"))
+knitr::kable(na_unknowns, caption = "Rows with NAs and unknowns")
+```
+
+The table shows the percentage of rows that have an NA value (= present) that also have 
+an "unknown" and the percentage of those that have an NA, but do not have an unknown. 
+The same analysis was carried out for rows that do not have NAs present (= absent). 
+
+Only 1% of rows which have an "unknown" or "u" variable, also have an NA. This 
+result confirms my suspicion that I should leave these two variables as 
+separate variables. 
+
+
+# Visualizing some variables
+
+## Shooting incidents by year and victim survival
+
+I will start with the year of the shooting and whether the victim has survived
+the shooting. 
+
+First, I need the number of shooting incidents per year and whether the victim
+survived: 
+
+```{r message = FALSE, warning = FALSE}
+survivalYear <- clean_data %>% 
+  group_by(YEAR,MURDER) %>% #grouping by year and survival
+  summarise(VictimCount = n()) %>% #counting rows for each group
+  ungroup()%>%
+  group_by(YEAR) %>% #grouping by just year
+  mutate(Ratio = paste0(round(100*VictimCount/sum(VictimCount),0), "%")) #% survival vs. killed
+knitr::kable(head(survivalYear), caption= "First rows of survivors vs. murder victims") 
+```
+
+And the graph: 
+
+```{r message = FALSE, warning = FALSE}
+ggplot(survivalYear, aes(y=VictimCount, x=factor(YEAR), fill = MURDER))+
+  geom_bar(stat="identity")  +
+  labs(x = "Year", y = "Shooting incidents", fill="Victims",
+       title = "Shooting Incidents in New York City, 2006-2020",
+       subtitle = "Comparing survivors and non-survivors") +
+  geom_text(aes(label = Ratio, vjust = 1.4), size = 4) + 
+  theme_minimal()  + 
+  theme(legend.position = "bottom") +
+  scale_fill_brewer (palette="Accent", labels = c("Survived", "Killed")) 
+```
+
+
+## Shooting incidents by season
+
+Counting the number of incidents per season, followed by a bar plot:
+
+```{r message = FALSE, warning = FALSE}
+seasonShootings <- clean_data %>% 
+  group_by(SEASON) %>% 
+  summarise(BySeason = n()) #number of shooting incidents by season
+
+ggplot(seasonShootings, aes(y=BySeason, x=factor(SEASON)))+
+  geom_bar(stat="identity", fill='palegreen3')  +
+  labs(x = "Season", y = "Shooting incidents",
+       title = "Shooting Incidents in New York City by season",
+       caption = "Data collection: 2006-2020") +
+  theme_minimal()  
+```
+
+## Month of shooting incident and victim survival
+
+Looking at the combination of month of shooting incidents and whether the
+victim survived:
+
+```{r message = FALSE, warning = FALSE}
+survivalMonth <- clean_data %>% 
+  group_by(MONTH,MURDER) %>% 
+  summarise(SuMo = n()) %>% #number of shootings per month and per outcome
+  ungroup()%>%
+  group_by(MONTH) %>%
+  mutate(Ratio = paste0(round(100*SuMo/sum(SuMo),0), "%")) #ratio of survival vs. murder per month
+
+ggplot(survivalMonth, aes(y=SuMo, x=factor(MONTH), fill = MURDER))+
+  geom_bar(stat="identity")  +
+  labs(x = "Month", y = "Shooting incidents", fill="Victims",
+       title = "Shooting Incidents in New York City by Month",
+       subtitle = "Comparing survivors and non-survivors",
+       caption = "Data collection: 2006-2020") +
+  geom_text(aes(label = Ratio, vjust = 1.3), size = 4) + 
+  theme_minimal()  +
+  theme(legend.position = "bottom") +
+  scale_fill_brewer (palette="Accent", labels = c("Survived", "Killed")) 
+```
+
+## Male vs. female victims 
+
+Shooting incidents through time, comparing male and female victims
+
+```{r message = FALSE, warning = FALSE}
+shootingsFeMa <- clean_data %>% 
+  group_by(YEAR,VIC_SEX) %>% 
+  summarise(FeMa = n()) #shootings per year, per victim sex
+
+ggplot(data = shootingsFeMa, aes(x=factor(YEAR), 
+                                 y = FeMa, group = VIC_SEX, col = VIC_SEX)) +
+      geom_line(size=1) +
+      labs(x = "Year", y = "Shooting victims", col = "Victims",
+           title = "Comparing Male and Female Shooting Victims by Year") +
+      theme_minimal()  +
+  theme(legend.position = "bottom") +
+  scale_colour_brewer (palette="Accent", labels = c("Female", "Male", "Unknown"))
+```
+
+## Comparing shooting incidents across boroughs
+
+Shooting incidents per year, comparing different boroughs
+
+```{r message = FALSE, warning = FALSE}
+timeBoroughs <- clean_data %>% 
+  group_by(YEAR,BORO) %>% 
+  summarise(TimeBo = n()) #shootings per year per borough
+
+ggplot(data = timeBoroughs, aes(x=factor(YEAR), 
+                                 y = TimeBo, group = BORO, col = BORO)) +
+  geom_line(size=1) +
+  labs(x = "Year", y = "Shooting victims", col = "Borough",
+       title = "Shooting Incidents in New York City",
+       subtitle = "Comparing shooting incidents across boroughs") +
+  theme_minimal()  +
+  theme(legend.position = "bottom") +
+  scale_colour_brewer (palette="Accent")
+```
+
+## Shooting incident map
+
+And finally, a map comparing the total shooting incidents for each New York
+City borough, between 2006-2020.The following graph will summarize the overall 
+number of shooting incidents for each borough throughout the time frame of the 
+data collection. The graph above indicates that there may be large differences
+and these may be worth further exploration in the future. 
+
+To get shape data for each borough:
+
+```{r message = FALSE, warning = FALSE}
+shapeLink <- 'http://data.beta.nyc//dataset/0ff93d2d-90ba-457c-9f7e-39e47bf2ac5f/resource/35dd04fb-81b3-479b-a074-a27a37888ce7/download/d085e2f8d0b54d4590b1e7d1f35594c1pediacitiesnycneighborhoods.geojson'
+nyc_shape_data <- GET(shapeLink)
+#Making loaded shape data suitable for R:
+nyc_shapes <- readOGR(content(nyc_shape_data,'text'), 'OGRGeoJSON', verbose = F)
+```
+
+Turning the shape data into a data frame:
+
+```{r message = FALSE, warning = FALSE}
+nyc_shapes_df <- tidy(nyc_shapes, region = "borough") #convert to data frame
+knitr::kable(head(nyc_shapes_df), caption = "First rows of NYC shape data as data frame")
+```
+
+Calculating centroids and merging those with incident numbers, so the map can be
+combined with a bubble plot. 
+
+```{r message = FALSE, warning = FALSE}
+borough_data <- nyc_shapes_df %>%
+  group_by (id) %>%
+  mutate (Centroid = centroid(as.matrix(cbind(long, lat)))) %>% #centroid calculation
+  ungroup()%>%
+  group_by (id, Centroid) %>%
+  summarise(CasesByBoro = n()) #cases by borough and centroid
+knitr::kable(borough_data, caption = "Centroids of boroughs and shooting incidents")
+```
+
+And finally the plot:
+
+```{r message = FALSE, warning = FALSE}
+ggplot() + 
+  geom_polygon(data=nyc_shapes_df, aes(x=long, y=lat, group=group,  fill = id))+
+  labs(fill = "Borough", title = "Shooting Incidents in New York City, 2006-2020") +
+  geom_point(data = borough_data, aes(x = Centroid[,1], y = Centroid[,2], 
+                                      size = CasesByBoro), color = "grey", 
+             alpha = 0.7, show.legend = FALSE) +
+  scale_size(range = c(15, 24)) +
+  geom_text(data = borough_data, aes(x = Centroid[,1], y = Centroid[,2], 
+                                     label = borough_data$CasesByBoro)) +
+  theme_map() + theme(legend.position = "bottom")+
+  scale_fill_viridis_d ()
+```
+
+
+# Regression analysis
+
+## Does year predict amount of shooting incidents?
+
+
+First, I will create a data frame containing incident count per year. As NAs are
+not present in the year column and incident count is not affected by NAs,  I will 
+not have to delete the affected rows. 
+
+```{r message = FALSE, warning = FALSE}
+yearly_data <- clean_data %>% 
+  group_by(YEAR) %>% 
+  summarise(Incident_Count = n()) %>% #incident count by year
+  ungroup() 
+```
+
+Linear model for incident count by borough
+
+```{r message = FALSE, warning = FALSE}
+time_model <- lm(Incident_Count~YEAR, data = yearly_data) #linear regression
+summary(time_model) #taking a look at the model
+```
+
+**Interpretation of regression results:**
+
+* A p-value of 0.002609 indicates that there is a statistically significant relationship between year and amount of shooting incidents.
+HOWEVER:
+* Resisuals are not strongly symmetrically distributed, meaning that some of the predicted values are not close to the actual values. Therefore, the model does not fit very well. 
+* The model only explains 51% of the variation, as indicated by the R-squared value. 
+
+In summary: While there is a significant relationship between year and shooting incidents, year is not a reliable sole predictor for shooting incidents in the given dataset. 
+
+## Plotting actual vs. predicted data
+
+Merging predictions and actual data:
+
+```{r message = FALSE, warning = FALSE}
+combined_real_pred <- yearly_data %>% 
+  rename(Actual = Incident_Count) %>%
+  mutate(Prediction = predict(time_model)) %>% #adding a prediction column
+  pivot_longer(c(Actual, Prediction), names_to = "Nature", values_to = "Victim_count")  #wide to long format
+knitr::kable(head(combined_real_pred), caption = "First rows of dataframe with actual and predicted data")
+```
+
+Followed by the plot:
+
+```{r}
+ggplot (data = combined_real_pred, aes(x = YEAR, y = Victim_count, group = Nature, color = Nature, shape = Nature)) +
+  geom_point(size = 3)+
+  labs(x = "Year", y = "Shooting Incidents", 
+       title = "Shooting Incidents in New York City",
+       subtitle = "Comparing actual and predicted values") + 
+  theme_minimal()
+```
+
+# Conclusion and Bias Identification
+
+The plot demonstrates why year is not a reliable indicator for the amount of 
+shooting incidents, even though there is a relationship between these two variables. 
+Year is simply just a label for 365 days which encompass countless events, 
+developments, and human decisions. Consequently, it makes sense that the data could not be 
+reliably predicted by only a year variable. The year 2020 is a good example for this. The 
+amount of shooting incidents in 2020 far exceed the predicted number of shooting
+incidents. It is unclear whether this spike in shooting incidents is connected 
+to the global covid-19 pandemic and whether future years would follow a linear 
+trend more reliably. However, one can envision shooting incidents to be affected
+by a lot of other factors besides a global pandemic, such as economic and 
+political factors, which would also not be year-dependent.
+
+The largest source of bias in this analysis is that it is based on the idea that
+time can be a predictor for human decision-making. This bias was mitigated through
+a conservative interpretation of the model. Other sources of bias are the selection
+of variables which were collected and recorded, and the arbitrary
+time frame (2006-2020). Additionally, predictions were made based on the analysis
+of the data at hand. However, in order to assess the reliability of the model, it would need
+to be also tested on other data. 
+
+It would be interesting to incorporate more variables and to see whether the 
+resulting model works for future years. Based on the data at hand, it would be
+worthwhile to include variables, such as borough, perpetrator and victim
+descriptions into the analysis. 
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+
+
